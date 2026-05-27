@@ -3,6 +3,8 @@
 youtube_channels:
   - channel_id: UCX6OQ3DkcsbYNE6H8uQQuVA
     label: MrBeast
+  - channel_id: UC-lHJZR3Gqxm24_Vd_AJ5Yw
+    label: PewDiePie
   # Add your entertainment channels below:
   # - channel_id: UCxxxxxxxxxxxxxxxxxx
   #   label: "Channel name"

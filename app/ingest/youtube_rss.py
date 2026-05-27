@@ -3,13 +3,14 @@
 from __future__ import annotations # Allows for the use of Python features in modules containing the future statement before statement is standard 
 
 import logging # Logging is a module that provides a logger object that can be used to log messages to a file or console.
-from dataclasses import dataclass, field    # Provides decorators and functions for automatically adding generated special methods.
+from dataclasses import dataclass    # Provides decorators and functions for automatically adding generated special methods.
                                             # dataclass is a decorator that automatically adds generated special methods to a class.
 from datetime import datetime, timedelta, timezone # upplies classes for parsing, manipulating and calculating differences in timedelta, and standardizing timezones for dates and times.                                 
 from pathlib import Path # OOP approach to handling filesystem paths, allows for cross-platform compatibility.
 from typing import Any # Allows for static type hinting, 'Any' indicates to type checkers a variable or parameter has an unconstrained type.
 
 import feedparser # Provides a way to parse RSS feeds.
+from pydantic import BaseModel, ConfigDict
 import requests # Provides a way to ma ke HTTP requests.
 import yaml # Provides a way to read and write YAML files, mapping configuration blocks safely into python.
 from youtube_transcript_api import YouTubeTranscriptApi # Provides a way to fetch transcripts for YouTube videos.
@@ -43,8 +44,11 @@ class YouTubeChannel:
     label: str = ""
 
 
-@dataclass(frozen=True)
-class YouTubeVideo:
+class YouTubeVideo(BaseModel):
+    """A video entry from a channel's YouTube RSS feed."""
+
+    model_config = ConfigDict(frozen=True)
+
     video_id: str
     title: str
     url: str
@@ -54,11 +58,20 @@ class YouTubeVideo:
     description: str = ""
 
 
-@dataclass
+class YouTubeTranscript(BaseModel):
+    """Transcript text for a YouTube video."""
+
+    model_config = ConfigDict(frozen=True)
+
+    video_id: str
+    text: str
+    language: str | None = None
+
+
+@dataclass(frozen=True)
 class VideoWithTranscript:
     video: YouTubeVideo
-    transcript_text: str
-    transcript_language: str | None = None # Allows for the transcript language to be None, indicating that the transcript is not available in another language.
+    transcript: YouTubeTranscript
 
 
 def load_channels(sources_path: Path | str | None = None) -> list[YouTubeChannel]: # Type hints say argument may be a Path, string or None, while returning a list of the YouTubeChannel class. 
@@ -224,15 +237,14 @@ def fetch_transcript(
     video_id: str,
     *,
     languages: list[str] | None = None,
-) -> tuple[str, str | None]: # Type hints say argument is a string, while returning a tuple of a string and a string or None.
+) -> YouTubeTranscript:
 
     """
     Fetch transcript text for a video using youtube-transcript-api.
 
-    Returns (full_text, language_code).
     Raises on missing/disabled transcripts.
     """
-    
+
     languages = languages or ["es", "en"]
     api = YouTubeTranscriptApi()
     fetched = api.fetch(video_id, languages=languages)
@@ -242,7 +254,7 @@ def fetch_transcript(
         snippets[0].get("language") if snippets else None
     )
     text = " ".join(s["text"].strip() for s in snippets if s.get("text"))
-    return text, language
+    return YouTubeTranscript(video_id=video_id, text=text, language=language)
 
 
 def fetch_transcript_safe(
@@ -253,7 +265,7 @@ def fetch_transcript_safe(
 
     """Like fetch_transcript but returns None instead of raising."""
     try:
-        text, language = fetch_transcript(video_id, languages=languages)
+        transcript = fetch_transcript(video_id, languages=languages)
         return VideoWithTranscript(
             video=YouTubeVideo(
                 video_id=video_id,
@@ -262,8 +274,7 @@ def fetch_transcript_safe(
                 published_at=datetime.now(timezone.utc),
                 channel_id="",
             ),
-            transcript_text=text,
-            transcript_language=language,
+            transcript=transcript,
         )
     except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as exc:
         logger.warning("No transcript for %s: %s", video_id, exc)
@@ -280,14 +291,8 @@ def enrich_with_transcripts(
     results: list[VideoWithTranscript] = []
     for video in videos:
         try:
-            text, language = fetch_transcript(video.video_id, languages=languages)
-            results.append(
-                VideoWithTranscript(
-                    video=video,
-                    transcript_text=text,
-                    transcript_language=language,
-                )
-            )
+            transcript = fetch_transcript(video.video_id, languages=languages)
+            results.append(VideoWithTranscript(video=video, transcript=transcript))
         except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as exc:
             logger.warning(
                 "Skipping %s (%s): %s",
@@ -325,7 +330,10 @@ def _print_results(items: list[YouTubeVideo] | list[VideoWithTranscript]) -> Non
     for item in items:
         if isinstance(item, VideoWithTranscript):
             video = item.video
-            extra = f"\n  transcript ({item.transcript_language}): {item.transcript_text[:200]}..."
+            extra = (
+                f"\n  transcript ({item.transcript.language}): "
+                f"{item.transcript.text[:200]}..."
+            )
         else:
             video = item
             extra = ""
