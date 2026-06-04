@@ -5,6 +5,8 @@ youtube_channels:
     label: MrBeast
   - channel_id: UC-lHJZR3Gqxm24_Vd_AJ5Yw
     label: PewDiePie
+  - channel_id: UCbY9xX3_jW5c2fjlZVBI4cg
+    label: TheAiGrid
   # Add your entertainment channels below:
   # - channel_id: UCxxxxxxxxxxxxxxxxxx
   #   label: "Channel name"
