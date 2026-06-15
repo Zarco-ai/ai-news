@@ -3,7 +3,6 @@
 from __future__ import annotations # postpones evaluation of type annotations
 
 from datetime import datetime # Supplies standard type for manipulating dates and times in Python
-from enum import StrEnum # Creates enumeration constants that are also subclasses of strings
 
 from sqlalchemy import DateTime, ForeignKey, String, Text, func # DateTime: SQL-agnostic type that maps python 'datetime' objects to time columns
                                                                 # ForeignKey: Defines a dependency constraint indicating that a column value must exist in a column of another table.
@@ -15,14 +14,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship  # Mapped: A gene
                                                                 # mapped_coloumn: The primary ORM construct used to customize column behavior (like nullability, defaults, or keys) inside a Mapped type declaration.
                                                                 # relationship: Defines a high-level, object-oriented link between two mapped database classes
 from app.db.base import Base # Imports your custom, local declarative base class (typically built using DeclarativeBase) that all your database models must inherit from to be tracked by the ORM.
-
-
-class TranscriptStatus(StrEnum):
-    """Status of a transcript."""
-    PENDING = "pending"
-    SUCCESS = "success"
-    FAILED = "failed"
-    UNAVAILABLE = "unavailable"
 
 
 class Channel(Base):
@@ -54,9 +45,6 @@ class Video(Base):
     url: Mapped[str] = mapped_column(String(512), default="")
     description: Mapped[str] = mapped_column(Text, default="")
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    transcript_status: Mapped[str] = mapped_column(
-        String(32), default=TranscriptStatus.PENDING, index=True
-    )
     transcript_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -78,7 +66,7 @@ class Transcript(Base):
         String(32), ForeignKey("videos.video_id"), primary_key=True
     )
     text: Mapped[str] = mapped_column(Text, default="")
-    language: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    language: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -90,4 +78,6 @@ class Transcript(Base):
 All This file is for is to generate the tables for my postgresql database, and be able to vizualize them into my TablePlus application. 
 It works because whenever I have my docker container which holds my Postgresql database running, I can generate tables with the data that is inside of it 
 using TablePlus with my locally ran docker container (locally meaning it is ran on my computers memory and not some cloud server)
+
+This is a database repository that says, "this is how you create a Youtube video."
 """

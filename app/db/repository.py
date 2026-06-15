@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Channel, Transcript, TranscriptStatus, Video
+from app.db.models import Channel, Transcript, Video
 from app.ingest.youtube_rss import YouTubeTranscript, YouTubeVideo
 
 
@@ -20,108 +20,92 @@ class VideoRepository:
         if channel is None:
             channel = Channel(channel_id=channel_id, label=label)
             self.session.add(channel)
+            self.session.flush()
         elif label and channel.label != label:
             channel.label = label
         return channel
 
-    def upsert_video(self, video: YouTubeVideo) -> tuple[Video, bool]:
+    def insert_video(self, video: YouTubeVideo) -> tuple[Video, bool]:
         """
-        Insert or update video metadata.
+        Insert video metadata when the video_id is new.
 
-        Returns (row, created) where created is True for a new row.
+        Returns (row, created). Existing rows are returned unchanged (skipped).
         """
         self.upsert_channel(video.channel_id, video.channel_label)
 
         row = self.session.get(Video, video.video_id)
-        created = row is None
-        if row is None:
-            row = Video(
-                video_id=video.video_id,
-                channel_id=video.channel_id,
-                title=video.title,
-                url=video.url,
-                description=video.description,
-                published_at=video.published_at,
-                transcript_status=TranscriptStatus.PENDING,
-            )
-            self.session.add(row)
-        else:
-            row.title = video.title
-            row.url = video.url
-            row.description = video.description
-            row.published_at = video.published_at
-            if row.channel_id != video.channel_id:
-                row.channel_id = video.channel_id
+        if row is not None:
+            return row, False
 
-        return row, created
+        row = Video(
+            video_id=video.video_id,
+            channel_id=video.channel_id,
+            title=video.title,
+            url=video.url,
+            description=video.description,
+            published_at=video.published_at,
+        )
+        self.session.add(row)
+        return row, True
 
-    def upsert_videos(self, videos: list[YouTubeVideo]) -> tuple[int, int]:
-        """Upsert many videos. Returns (created_count, updated_count)."""
+    def insert_videos(self, videos: list[YouTubeVideo]) -> tuple[int, int]:
+        """Insert new videos only. Returns (created_count, skipped_count)."""
         created_count = 0
-        updated_count = 0
+        skipped_count = 0
         for video in videos:
-            _, created = self.upsert_video(video)
+            _, created = self.insert_video(video)
             if created:
                 created_count += 1
             else:
-                updated_count += 1
+                skipped_count += 1
         self.session.flush()
-        return created_count, updated_count
+        return created_count, skipped_count
 
-    def list_videos_pending_transcript(
+    def list_videos_needing_transcript(
         self,
         *,
         limit: int | None = 50,
         include_failed: bool = True,
     ) -> list[Video]:
-        statuses = [TranscriptStatus.PENDING]
-        if include_failed:
-            statuses.append(TranscriptStatus.FAILED)
-
+        """Videos with no transcript row yet (optionally excluding prior failures)."""
         stmt = (
             select(Video)
-            .where(Video.transcript_status.in_(statuses))
-            .order_by(Video.published_at.desc())
+            .outerjoin(Transcript, Video.video_id == Transcript.video_id)
+            .where(Transcript.video_id.is_(None))
         )
+        if not include_failed:
+            stmt = stmt.where(Video.transcript_error.is_(None))
+
+        stmt = stmt.order_by(Video.published_at.desc())
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt))
 
-    def save_transcript(self, transcript: YouTubeTranscript) -> Transcript:
+    def save_transcript(self, transcript: YouTubeTranscript) -> Transcript | None:
         video = self.session.get(Video, transcript.video_id)
         if video is None:
             raise ValueError(f"Video {transcript.video_id} not found in database")
 
         row = self.session.get(Transcript, transcript.video_id)
-        if row is None:
-            row = Transcript(
-                video_id=transcript.video_id,
-                text=transcript.text,
-                language=transcript.language,
-                fetched_at=datetime.now(timezone.utc),
-            )
-            self.session.add(row)
-        else:
-            row.text = transcript.text
-            row.language = transcript.language
-            row.fetched_at = datetime.now(timezone.utc)
+        if row is not None:
+            return row
 
-        video.transcript_status = TranscriptStatus.SUCCESS
+        row = Transcript(
+            video_id=transcript.video_id,
+            text=transcript.text,
+            language=transcript.language,
+            fetched_at=datetime.now(timezone.utc),
+        )
+        self.session.add(row)
         video.transcript_error = None
         return row
 
-    def mark_transcript_unavailable(self, video_id: str, error: str) -> None:
+    def record_transcript_failure(self, video_id: str, error: str) -> None:
         video = self.session.get(Video, video_id)
         if video is None:
             return
-        video.transcript_status = TranscriptStatus.UNAVAILABLE
-        video.transcript_error = error[:2000]
-
-    def mark_transcript_failed(self, video_id: str, error: str) -> None:
-        video = self.session.get(Video, video_id)
-        if video is None:
+        if self.session.get(Transcript, video_id) is not None:
             return
-        video.transcript_status = TranscriptStatus.FAILED
         video.transcript_error = error[:2000]
 
     def get_video(self, video_id: str) -> Video | None:

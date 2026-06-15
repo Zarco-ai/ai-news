@@ -25,29 +25,92 @@ from app.ingest.youtube_rss import (
 logger = logging.getLogger(__name__)
 
 
+def _fetch_and_save_transcript(
+    video_id: str,
+    title: str,
+    *,
+    languages: list[str] | None = None,
+) -> bool:
+    """Fetch a transcript and persist it. Returns True on success."""
+    try:
+        transcript = fetch_transcript(video_id, languages=languages)
+    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as exc:
+        logger.warning(
+            "Transcript unavailable for %s (%s): %s",
+            title,
+            video_id,
+            exc,
+        )
+        with get_session() as session:
+            repo = VideoRepository(session)
+            repo.record_transcript_failure(video_id, str(exc))
+        return False
+    except Exception:
+        logger.exception(
+            "Transcript fetch failed for %s (%s)",
+            title,
+            video_id,
+        )
+        with get_session() as session:
+            repo = VideoRepository(session)
+            repo.record_transcript_failure(video_id, "transcript fetch failed")
+        return False
+
+    with get_session() as session:
+        repo = VideoRepository(session)
+        repo.save_transcript(transcript)
+
+    logger.info("Saved transcript for %s (%s)", title, video_id)
+    return True
+
+
 def run_metadata_ingest(
     *,
     hours: int = 24,
     sources_path: Path | str | None = None,
+    languages: list[str] | None = None,
 ) -> list[YouTubeVideo]:
     """
-    Step 1: scrape RSS metadata and persist videos/channels to the database.
-    Transcripts are left as pending for a later batch job.
+    Scrape RSS metadata, insert new videos (skip duplicates), and fetch
+    transcripts for each newly inserted video.
     """
     videos = discover_recent_videos(hours=hours, sources_path=sources_path)
     if not videos:
         logger.info("No recent videos found in the last %s hours.", hours)
         return []
 
+    new_videos: list[YouTubeVideo] = []
     with get_session() as session:
         repo = VideoRepository(session)
-        created, updated = repo.upsert_videos(videos)
+        for video in videos:
+            _, created = repo.insert_video(video)
+            if created:
+                new_videos.append(video)
 
     logger.info(
-        "Stored metadata for %d videos (%d created, %d updated).",
+        "Stored metadata for %d videos (%d created, %d skipped as duplicates).",
         len(videos),
-        created,
-        updated,
+        len(new_videos),
+        len(videos) - len(new_videos),
+    )
+
+    if not new_videos:
+        return videos
+
+    logger.info("Fetching transcripts for %d new videos.", len(new_videos))
+    success_count = 0
+    for video in new_videos:
+        if _fetch_and_save_transcript(
+            video.video_id,
+            video.title,
+            languages=languages,
+        ):
+            success_count += 1
+
+    logger.info(
+        "Transcript fetch complete for new videos: %d/%d succeeded.",
+        success_count,
+        len(new_videos),
     )
     return videos
 
@@ -59,57 +122,28 @@ def run_transcript_ingest(
     include_failed: bool = True,
 ) -> int:
     """
-    Step 2: fetch transcripts for videos pending in the database.
+    Fetch transcripts for videos that still have no transcript row.
 
     Returns the number of transcripts successfully saved.
     """
-    success_count = 0
-
     with get_session() as session:
         repo = VideoRepository(session)
-        pending_rows = repo.list_videos_pending_transcript(
+        pending_rows = repo.list_videos_needing_transcript(
             limit=limit,
             include_failed=include_failed,
         )
         pending = [(row.video_id, row.title) for row in pending_rows]
 
     if not pending:
-        logger.info("No videos pending transcript processing.")
+        logger.info("No videos needing transcript processing.")
         return 0
 
     logger.info("Processing transcripts for %d videos.", len(pending))
 
+    success_count = 0
     for video_id, title in pending:
-        try:
-            transcript = fetch_transcript(video_id, languages=languages)
-        except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as exc:
-            logger.warning(
-                "Transcript unavailable for %s (%s): %s",
-                title,
-                video_id,
-                exc,
-            )
-            with get_session() as session:
-                repo = VideoRepository(session)
-                repo.mark_transcript_unavailable(video_id, str(exc))
-            continue
-        except Exception:
-            logger.exception(
-                "Transcript fetch failed for %s (%s)",
-                title,
-                video_id,
-            )
-            with get_session() as session:
-                repo = VideoRepository(session)
-                repo.mark_transcript_failed(video_id, "transcript fetch failed")
-            continue
-
-        with get_session() as session:
-            repo = VideoRepository(session)
-            repo.save_transcript(transcript)
-
-        success_count += 1
-        logger.info("Saved transcript for %s (%s)", title, video_id)
+        if _fetch_and_save_transcript(video_id, title, languages=languages):
+            success_count += 1
 
     logger.info(
         "Transcript batch complete: %d/%d succeeded.",
@@ -142,7 +176,11 @@ def run_scheduled_ingest(
         logger.info("Starting ingest job=%s at %s", job, started_at.isoformat())
         try:
             if job in ("metadata", "both"):
-                run_metadata_ingest(hours=hours_window, sources_path=sources_path)
+                run_metadata_ingest(
+                    hours=hours_window,
+                    sources_path=sources_path,
+                    languages=languages,
+                )
             if job in ("transcripts", "both"):
                 run_transcript_ingest(
                     languages=languages,
@@ -178,16 +216,16 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Run YouTube RSS ingest (metadata first, transcripts later)"
+        description="Run YouTube RSS ingest (metadata + transcripts for new videos)"
     )
     parser.add_argument(
         "--job",
         choices=["metadata", "transcripts", "both"],
         default="metadata",
         help=(
-            "metadata: RSS scrape + DB storage only; "
-            "transcripts: batch transcript fetch for pending videos; "
-            "both: run metadata then transcripts."
+            "metadata: RSS scrape, insert new videos, fetch their transcripts; "
+            "transcripts: retry videos still missing a transcript; "
+            "both: run metadata then transcript retry batch."
         ),
     )
     parser.add_argument(
@@ -206,12 +244,12 @@ if __name__ == "__main__":
         "--transcript-batch-size",
         type=int,
         default=50,
-        help="Max videos to process per transcript batch.",
+        help="Max videos to process per transcript retry batch.",
     )
     parser.add_argument(
         "--no-retry-failed",
         action="store_true",
-        help="Only process pending videos; skip previously failed ones.",
+        help="Only process videos never attempted; skip prior failures.",
     )
     parser.add_argument(
         "--languages",
