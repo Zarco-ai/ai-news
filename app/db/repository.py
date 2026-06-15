@@ -1,4 +1,10 @@
-"""CRUD repository for YouTube ingest tables."""
+"""CRUD repository for the WhatsApp AI tutor tables.
+
+`ChatRepository` is the single API the webhook flow uses to persist a turn:
+upsert the agent + user, find/create their conversation, and record each
+message. It also records raw webhook events so duplicate deliveries from Meta
+are processed only once.
+"""
 
 from __future__ import annotations
 
@@ -7,119 +13,118 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Channel, Transcript, Video
-from app.ingest.youtube_rss import YouTubeTranscript, YouTubeVideo
+from app.db.models import Agent, Conversation, Message, User, WebhookEvent
 
 
-class VideoRepository:
+class ChatRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def upsert_channel(self, channel_id: str, label: str = "") -> Channel:
-        channel = self.session.get(Channel, channel_id)
-        if channel is None:
-            channel = Channel(channel_id=channel_id, label=label)
-            self.session.add(channel)
+    # --- identity -------------------------------------------------------
+
+    def upsert_agent(self, phone_number_id: str, display_name: str = "ai_spanish_tutor") -> Agent:
+        """Ensure the tutor's WhatsApp number (PHONE_NUMBER_ID) exists."""
+        agent = self.session.get(Agent, phone_number_id)
+        if agent is None:
+            agent = Agent(phone_number_id=phone_number_id, display_name=display_name)
+            self.session.add(agent)
             self.session.flush()
-        elif label and channel.label != label:
-            channel.label = label
-        return channel
+        elif display_name and agent.display_name != display_name:
+            agent.display_name = display_name
+        return agent
 
-    def insert_video(self, video: YouTubeVideo) -> tuple[Video, bool]:
-        """
-        Insert video metadata when the video_id is new.
+    def upsert_user(self, wa_id: str, profile_name: str = "") -> User:
+        """Ensure the texting user exists; refresh their profile name."""
+        user = self.session.get(User, wa_id)
+        if user is None:
+            user = User(wa_id=wa_id, profile_name=profile_name)
+            self.session.add(user)
+            self.session.flush()
+        elif profile_name and user.profile_name != profile_name:
+            user.profile_name = profile_name
+        return user
 
-        Returns (row, created). Existing rows are returned unchanged (skipped).
-        """
-        self.upsert_channel(video.channel_id, video.channel_label)
+    # --- sessions -------------------------------------------------------
 
-        row = self.session.get(Video, video.video_id)
-        if row is not None:
-            return row, False
-
-        row = Video(
-            video_id=video.video_id,
-            channel_id=video.channel_id,
-            title=video.title,
-            url=video.url,
-            description=video.description,
-            published_at=video.published_at,
+    def get_or_create_conversation(
+        self, user_wa_id: str, agent_phone_number_id: str
+    ) -> Conversation:
+        """Return the active conversation for this user+agent, or start one."""
+        stmt = (
+            select(Conversation)
+            .where(
+                Conversation.user_wa_id == user_wa_id,
+                Conversation.agent_phone_number_id == agent_phone_number_id,
+                Conversation.status == "active",
+            )
+            .order_by(Conversation.last_message_at.desc())
+            .limit(1)
         )
-        self.session.add(row)
-        return row, True
+        conversation = self.session.scalars(stmt).first()
+        if conversation is None:
+            conversation = Conversation(
+                user_wa_id=user_wa_id,
+                agent_phone_number_id=agent_phone_number_id,
+            )
+            self.session.add(conversation)
+            self.session.flush()
+        return conversation
 
-    def insert_videos(self, videos: list[YouTubeVideo]) -> tuple[int, int]:
-        """Insert new videos only. Returns (created_count, skipped_count)."""
-        created_count = 0
-        skipped_count = 0
-        for video in videos:
-            _, created = self.insert_video(video)
-            if created:
-                created_count += 1
-            else:
-                skipped_count += 1
-        self.session.flush()
-        return created_count, skipped_count
+    # --- messages -------------------------------------------------------
 
-    def list_videos_needing_transcript(
+    def record_message(
         self,
         *,
-        limit: int | None = 50,
-        include_failed: bool = True,
-    ) -> list[Video]:
-        """Videos with no transcript row yet (optionally excluding prior failures)."""
-        stmt = (
-            select(Video)
-            .outerjoin(Transcript, Video.video_id == Transcript.video_id)
-            .where(Transcript.video_id.is_(None))
+        conversation: Conversation,
+        user_wa_id: str,
+        direction: str,
+        role: str,
+        content: str,
+        message_type: str = "text",
+        wa_message_id: str | None = None,
+        status: str | None = None,
+    ) -> Message:
+        """Insert one message and bump the conversation's activity counters."""
+        message = Message(
+            conversation_id=conversation.id,
+            user_wa_id=user_wa_id,
+            wa_message_id=wa_message_id,
+            direction=direction,
+            role=role,
+            message_type=message_type,
+            content=content,
+            status=status,
         )
-        if not include_failed:
-            stmt = stmt.where(Video.transcript_error.is_(None))
+        self.session.add(message)
+        conversation.message_count += 1
+        conversation.last_message_at = datetime.now(timezone.utc)
+        self.session.flush()
+        return message
 
-        stmt = stmt.order_by(Video.published_at.desc())
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt))
+    # --- reliability ----------------------------------------------------
 
-    def save_transcript(self, transcript: YouTubeTranscript) -> Transcript | None:
-        video = self.session.get(Video, transcript.video_id)
-        if video is None:
-            raise ValueError(f"Video {transcript.video_id} not found in database")
-
-        row = self.session.get(Transcript, transcript.video_id)
-        if row is not None:
-            return row
-
-        row = Transcript(
-            video_id=transcript.video_id,
-            text=transcript.text,
-            language=transcript.language,
-            fetched_at=datetime.now(timezone.utc),
+    def record_webhook_event(
+        self,
+        *,
+        event_key: str,
+        event_type: str,
+        payload: str,
+        phone_number_id: str | None = None,
+    ) -> bool:
+        """Record a webhook delivery. Returns True if it's new, False if a
+        duplicate (already processed) so the caller can skip re-processing."""
+        existing = self.session.scalar(
+            select(WebhookEvent).where(WebhookEvent.event_key == event_key)
         )
-        self.session.add(row)
-        video.transcript_error = None
-        return row
-
-    def record_transcript_failure(self, video_id: str, error: str) -> None:
-        video = self.session.get(Video, video_id)
-        if video is None:
-            return
-        if self.session.get(Transcript, video_id) is not None:
-            return
-        video.transcript_error = error[:2000]
-
-    def get_video(self, video_id: str) -> Video | None:
-        return self.session.get(Video, video_id)
-
-    def list_recent_videos(self, *, limit: int = 20) -> list[Video]:
-        stmt = select(Video).order_by(Video.published_at.desc()).limit(limit)
-        return list(self.session.scalars(stmt))
-
-
-"""
-
-All this file is is an API for the file "runner.py" to use because in "runner.py" 
-it uses data ingestion tools from "youtube_rss.py", as well as ORM (from SQLAlchemy) from "repository.py"
-which makes us capable of putting our data into our relational Database (SQL). 
-
-"""
+        if existing is not None:
+            return False
+        self.session.add(
+            WebhookEvent(
+                event_key=event_key,
+                event_type=event_type,
+                payload=payload,
+                phone_number_id=phone_number_id,
+            )
+        )
+        self.session.flush()
+        return True

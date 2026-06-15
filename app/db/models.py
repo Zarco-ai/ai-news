@@ -1,51 +1,35 @@
-"""SQLAlchemy models for YouTube ingest."""
+"""SQLAlchemy models for the WhatsApp AI Spanish tutor.
 
-from __future__ import annotations # postpones evaluation of type annotations
+The schema is organized in the layers the app cares about:
 
-from datetime import datetime # Supplies standard type for manipulating dates and times in Python
+- Agent       -> identity of the WhatsApp number acting as the tutor (PHONE_NUMBER_ID)
+- User        -> the people who text the tutor (identity)
+- Conversation-> a chat session between one user and one agent (session state)
+- Message     -> every inbound/outbound message (source of truth for history)
+- WebhookEvent-> raw webhook deliveries, used for idempotency/debugging (reliability)
+"""
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func # DateTime: SQL-agnostic type that maps python 'datetime' objects to time columns
-                                                                # ForeignKey: Defines a dependency constraint indicating that a column value must exist in a column of another table.
-                                                                # String: variable-length string SQL type
-                                                                # Text: Represents an unbounded or large variable-length string SQL type
-                                                                # func: An generator object used to invoke SQL functions (like NOW(), COUNT(), or MAX()) natively in queries.
+from __future__ import annotations
 
-from sqlalchemy.orm import Mapped, mapped_column, relationship  # Mapped: A generic type configuration wrapper used in modern declarative mapping to denote a class attribute as a database coloumn
-                                                                # mapped_coloumn: The primary ORM construct used to customize column behavior (like nullability, defaults, or keys) inside a Mapped type declaration.
-                                                                # relationship: Defines a high-level, object-oriented link between two mapped database classes
-from app.db.base import Base # Imports your custom, local declarative base class (typically built using DeclarativeBase) that all your database models must inherit from to be tracked by the ORM.
+from datetime import datetime
 
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-class Channel(Base):
-    __tablename__ = "channels" # The name of the table in the database.
-
-    channel_id: Mapped[str] = mapped_column(String(64), primary_key=True)   # Mapped Says this is a column in the database ("Channel_id")
-                                                                            # mapped_column is a function used to create the entire column. I think this is ORM being used 
-                                                                            # String(64) is the length of the column in the database.
-                                                                            # primary_key=True means that this column is the primary key of the table.
-    label: Mapped[str] = mapped_column(String(255), default="") # default="" means that the column will be empty by default.
-    created_at: Mapped[datetime] = mapped_column(           # "Mapped[datetime]" says this coulmn is a "datetime" data type
-        DateTime(timezone=True), server_default=func.now()  # "Datetime()" is the time for ingestion? or time channel was last ingested?
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    videos: Mapped[list[Video]] = relationship(back_populates="channel")
+from app.db.base import Base
 
 
-class Video(Base):
-    __tablename__ = "videos"
+class Agent(Base):
+    """A WhatsApp number that acts as the AI tutor.
 
-    video_id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    channel_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("channels.channel_id"), index=True
-    )
-    title: Mapped[str] = mapped_column(String(512), default="")
-    url: Mapped[str] = mapped_column(String(512), default="")
-    description: Mapped[str] = mapped_column(Text, default="")
-    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    transcript_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    `phone_number_id` is the Meta `PHONE_NUMBER_ID` so you always know which
+    number replied (e.g. the ai_spanish_tutor).
+    """
+
+    __tablename__ = "agents"
+
+    phone_number_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(255), default="ai_spanish_tutor")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -53,31 +37,100 @@ class Video(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    channel: Mapped[Channel] = relationship(back_populates="videos")
-    transcript: Mapped[Transcript | None] = relationship(
-        back_populates="video", uselist=False
-    )
+    conversations: Mapped[list[Conversation]] = relationship(back_populates="agent")
 
 
-class Transcript(Base):
-    __tablename__ = "transcripts"
+class User(Base):
+    """A person who texts the tutor, identified by their WhatsApp id (wa_id)."""
 
-    video_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("videos.video_id"), primary_key=True
-    )
-    text: Mapped[str] = mapped_column(Text, default="")
-    language: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    fetched_at: Mapped[datetime] = mapped_column(
+    __tablename__ = "users"
+
+    wa_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    profile_name: Mapped[str] = mapped_column(String(255), default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
-    video: Mapped[Video] = relationship(back_populates="transcript")
+    conversations: Mapped[list[Conversation]] = relationship(back_populates="user")
+    messages: Mapped[list[Message]] = relationship(back_populates="user")
 
 
-"""
-All This file is for is to generate the tables for my postgresql database, and be able to vizualize them into my TablePlus application. 
-It works because whenever I have my docker container which holds my Postgresql database running, I can generate tables with the data that is inside of it 
-using TablePlus with my locally ran docker container (locally meaning it is ran on my computers memory and not some cloud server)
+class Conversation(Base):
+    """A chat session between one user and one agent (tutor number)."""
 
-This is a database repository that says, "this is how you create a Youtube video."
-"""
+    __tablename__ = "conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_wa_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.wa_id"), index=True
+    )
+    agent_phone_number_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("agents.phone_number_id"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_message_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    user: Mapped[User] = relationship(back_populates="conversations")
+    agent: Mapped[Agent] = relationship(back_populates="conversations")
+    messages: Mapped[list[Message]] = relationship(back_populates="conversation")
+
+
+class Message(Base):
+    """A single inbound or outbound message in a conversation."""
+
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("conversations.id"), index=True
+    )
+    user_wa_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.wa_id"), index=True
+    )
+    # WhatsApp message id (wamid). Unique so duplicate webhook deliveries
+    # cannot insert the same inbound message twice. Null for outbound replies
+    # whose id we don't track.
+    wa_message_id: Mapped[str | None] = mapped_column(
+        String(128), unique=True, nullable=True
+    )
+    direction: Mapped[str] = mapped_column(String(16))  # inbound | outbound
+    role: Mapped[str] = mapped_column(String(16))  # user | assistant
+    message_type: Mapped[str] = mapped_column(String(32), default="text")
+    content: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    conversation: Mapped[Conversation] = relationship(back_populates="messages")
+    user: Mapped[User] = relationship(back_populates="messages")
+
+
+class WebhookEvent(Base):
+    """Raw webhook deliveries from Meta.
+
+    `event_key` is a stable identifier for the delivery (the message wamid for
+    incoming messages, or the status id for status updates) so the same webhook
+    retry is not processed twice.
+    """
+
+    __tablename__ = "webhook_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(32), default="unknown")
+    phone_number_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload: Mapped[str] = mapped_column(Text, default="")
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
