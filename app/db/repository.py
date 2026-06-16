@@ -10,10 +10,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Agent, Conversation, Message, User, WebhookEvent
+from app.db.models import (
+    Agent,
+    ApiUsage,
+    Conversation,
+    Message,
+    User,
+    WebhookEvent,
+)
 
 
 class ChatRepository:
@@ -69,6 +76,11 @@ class ChatRepository:
             self.session.add(conversation)
             self.session.flush()
         return conversation
+
+    def set_last_response_id(self, conversation: Conversation, response_id: str) -> None:
+        """Persist the OpenAI Responses pointer so the next turn has context."""
+        conversation.last_response_id = response_id
+        self.session.flush()
 
     # --- messages -------------------------------------------------------
 
@@ -128,3 +140,43 @@ class ChatRepository:
         )
         self.session.flush()
         return True
+
+    # --- cost tracking + budget -----------------------------------------
+
+    def record_api_usage(
+        self,
+        *,
+        wa_id: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float,
+    ) -> ApiUsage:
+        """Log one OpenAI call's tokens and computed USD cost."""
+        usage = ApiUsage(
+            wa_id=wa_id,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+        )
+        self.session.add(usage)
+        self.session.flush()
+        return usage
+
+    def count_user_messages_today(self, wa_id: str) -> int:
+        """Number of OpenAI calls made for this user since UTC midnight."""
+        start_of_day = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        stmt = (
+            select(func.count())
+            .select_from(ApiUsage)
+            .where(ApiUsage.wa_id == wa_id, ApiUsage.created_at >= start_of_day)
+        )
+        return int(self.session.scalar(stmt) or 0)
+
+    def total_spend_usd(self) -> float:
+        """Running total of all OpenAI spend, for the global hard cap."""
+        stmt = select(func.coalesce(func.sum(ApiUsage.cost_usd), 0.0))
+        return float(self.session.scalar(stmt) or 0.0)

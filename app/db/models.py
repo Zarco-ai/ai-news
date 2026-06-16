@@ -13,7 +13,17 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -73,6 +83,10 @@ class Conversation(Base):
     )
     status: Mapped[str] = mapped_column(String(32), default="active")
     message_count: Mapped[int] = mapped_column(Integer, default=0)
+    # OpenAI Responses API conversation pointer. Stored here (not in a local
+    # file) so conversation memory survives deploys/restarts and works across
+    # multiple gunicorn workers.
+    last_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -134,3 +148,26 @@ class WebhookEvent(Base):
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class ApiUsage(Base):
+    """One row per OpenAI API call: tokens and computed USD cost.
+
+    This is the source of truth for both the per-user daily limit and the
+    global spend cap, and it lets you see per-user/day cost directly in TablePlus.
+    """
+
+    __tablename__ = "api_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wa_id: Mapped[str] = mapped_column(String(64), index=True)
+    model: Mapped[str] = mapped_column(String(64), default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    # Speeds up the per-user daily-limit query (wa_id + created_at range).
+    __table_args__ = (Index("ix_api_usage_wa_id_created_at", "wa_id", "created_at"),)

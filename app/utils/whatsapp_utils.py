@@ -78,6 +78,21 @@ def process_text_for_whatsapp(text):
     return whatsapp_style_text
 
 
+def _compute_cost_usd(input_tokens, output_tokens):
+    """USD cost of a call from token counts and the configured per-1M rates."""
+    input_rate = current_app.config["INPUT_COST_PER_1M"]
+    output_rate = current_app.config["OUTPUT_COST_PER_1M"]
+    return (input_tokens / 1_000_000) * input_rate + (
+        output_tokens / 1_000_000
+    ) * output_rate
+
+
+def _send_text(wa_id, text):
+    """Format for WhatsApp and send a plain text reply to a user."""
+    data = get_text_message_input(wa_id, process_text_for_whatsapp(text))
+    send_message(data)
+
+
 def process_whatsapp_message(body):
     wa_id = body["entry"][0]["changes"][0]["value"]["contacts"][0]["wa_id"]
     name = body["entry"][0]["changes"][0]["value"]["contacts"][0]["profile"]["name"]
@@ -89,9 +104,12 @@ def process_whatsapp_message(body):
 
     # The number acting as the ai_spanish_tutor (from .env via app config).
     phone_number_id = current_app.config["PHONE_NUMBER_ID"]
+    spend_cap = current_app.config["GLOBAL_SPEND_CAP_USD"]
+    per_user_limit = current_app.config["PER_USER_DAILY_LIMIT"]
 
-    # Persist the inbound turn. If this exact webhook (wamid) was already
-    # processed, skip everything so Meta retries don't double-reply.
+    # Persist the inbound turn and decide whether we're allowed to answer.
+    # If this exact webhook (wamid) was already processed, skip everything so
+    # Meta retries don't double-reply.
     with get_session() as session:
         repo = ChatRepository(session)
 
@@ -120,16 +138,40 @@ def process_whatsapp_message(body):
         )
 
         conversation_id = conversation.id
+        previous_response_id = conversation.last_response_id
 
-    # OpenAI Integration (Responses API)
-    response = generate_response(message_body, wa_id, name)
-    response = process_text_for_whatsapp(response)
+        # Budget gates (checked before spending any OpenAI tokens).
+        block_reason = None
+        if repo.total_spend_usd() >= spend_cap:
+            block_reason = "spend_cap"
+        elif repo.count_user_messages_today(wa_id) >= per_user_limit:
+            block_reason = "user_limit"
+
+    # If blocked, tell the user politely and stop (no OpenAI call).
+    if block_reason == "spend_cap":
+        logging.warning("Global spend cap reached; pausing OpenAI replies.")
+        _send_text(
+            wa_id,
+            "The tutor is taking a short break right now. Please try again later.",
+        )
+        return
+    if block_reason == "user_limit":
+        logging.info(f"Daily limit reached for {wa_id}.")
+        _send_text(
+            wa_id,
+            "You've reached today's practice limit. Let's continue tomorrow!",
+        )
+        return
+
+    # OpenAI Integration (Responses API). Context comes from the stored
+    # previous_response_id, not a local file.
+    reply = generate_response(message_body, wa_id, name, previous_response_id)
+    cost_usd = _compute_cost_usd(reply.input_tokens, reply.output_tokens)
 
     # Reply to the person who messaged us (wa_id), not a fixed recipient.
-    data = get_text_message_input(wa_id, response)
-    send_message(data)
+    _send_text(wa_id, reply.text)
 
-    # Persist the assistant's reply.
+    # Persist the assistant's reply, the conversation pointer, and the cost.
     with get_session() as session:
         repo = ChatRepository(session)
         conversation = repo.session.get(Conversation, conversation_id)
@@ -138,9 +180,17 @@ def process_whatsapp_message(body):
             user_wa_id=wa_id,
             direction="outbound",
             role="assistant",
-            content=response,
+            content=process_text_for_whatsapp(reply.text),
             message_type="text",
             status="sent",
+        )
+        repo.set_last_response_id(conversation, reply.response_id)
+        repo.record_api_usage(
+            wa_id=wa_id,
+            model=current_app.config["OPENAI_MODEL"],
+            input_tokens=reply.input_tokens,
+            output_tokens=reply.output_tokens,
+            cost_usd=cost_usd,
         )
 
 

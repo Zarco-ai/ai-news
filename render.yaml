@@ -1,0 +1,64 @@
+# Render Blueprint for the WhatsApp AI Spanish tutor.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# This provisions a managed Postgres database and a web service that runs the
+# Flask app under gunicorn. After the first deploy, fill in the secret env vars
+# (marked "sync: false") in the Render dashboard, then point your Meta webhook
+# Callback URL at https://<service>.onrender.com/webhook.
+
+databases:
+  - name: ai-tutor-db
+    # Paid plan recommended so the DB isn't suspended; adjust to your needs.
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: ai-spanish-tutor
+    runtime: python
+    # Starter (paid) so the instance does not spin down on idle, which would
+    # delay Meta webhook deliveries and trigger retries.
+    plan: starter
+    # uv installs dependencies from pyproject.toml/uv.lock.
+    buildCommand: pip install uv && uv sync --frozen --no-dev
+    # Run DB migrations before each deploy goes live.
+    preDeployCommand: uv run alembic upgrade head
+    startCommand: uv run gunicorn run:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 30
+    healthCheckPath: /webhook
+    envVars:
+      # Connection string is injected from the database above and normalized to
+      # postgresql+psycopg:// by app/db/config.py.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ai-tutor-db
+          property: connectionString
+      - key: ENV
+        value: production
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # Non-secret tunables (safe to keep in the repo).
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: VERSION
+        value: v18.0
+      - key: GLOBAL_SPEND_CAP_USD
+        value: "4.50"
+      - key: PER_USER_DAILY_LIMIT
+        value: "20"
+      - key: INPUT_COST_PER_1M
+        value: "0.15"
+      - key: OUTPUT_COST_PER_1M
+        value: "0.60"
+      # Secrets: set these in the Render dashboard, never commit them.
+      - key: ACCESS_TOKEN
+        sync: false
+      - key: APP_SECRET
+        sync: false
+      - key: APP_ID
+        sync: false
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
