@@ -24,7 +24,9 @@ services:
     # Run DB migrations before each deploy goes live.
     preDeployCommand: uv run alembic upgrade head
     startCommand: uv run gunicorn run:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 30
-    healthCheckPath: /webhook
+    # Dedicated liveness route that always returns 200. Pointing this at /webhook
+    # fails because a bare GET (no Meta hub.* params) returns 400.
+    healthCheckPath: /healthz
     envVars:
       # Connection string is injected from the database above and normalized to
       # postgresql+psycopg:// by app/db/config.py.

@@ -82,6 +82,14 @@ to make sure our application is safe, and the message sent is verified.
 
 verify() is used '''
 
+@webhook_blueprint.route("/healthz", methods=["GET"])  # Liveness probe for Render's health check
+def healthz():
+    # Plain 200 with no required params, so platform health checks (e.g. Render's
+    # zero-downtime deploy probe) don't get the 400 that /webhook returns for a
+    # request missing Meta's hub.* verification parameters.
+    return "ok", 200
+
+
 @webhook_blueprint.route("/webhook", methods=["GET"]) # Used for the first message/when you configure the webhook on metas dashboard
 def webhook_get():
     return verify()
