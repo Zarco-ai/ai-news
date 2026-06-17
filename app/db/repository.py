@@ -51,6 +51,12 @@ class ChatRepository:
             user.profile_name = profile_name
         return user
 
+    def confirm_age(self, user: User) -> None:
+        """Mark a user as having confirmed they are 18 or older."""
+        user.age_confirmed = True
+        user.age_confirmed_at = datetime.now(timezone.utc)
+        self.session.flush()
+
     # --- sessions -------------------------------------------------------
 
     def get_or_create_conversation(

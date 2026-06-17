@@ -93,6 +93,41 @@ def _send_text(wa_id, text):
     send_message(data)
 
 
+# Age gate replies and the words we accept as a yes/no to "are you 18+?".
+AGE_PROMPT = (
+    "Hi! Before we start: are you 18 years or older? Reply YES to continue. "
+    "(Hola, antes de empezar: ¿tienes 18 anos o mas? Responde SI para continuar.)"
+)
+AGE_WELCOME = (
+    "Great, thanks! Let's start practicing your Spanish. "
+    "(Perfecto, gracias. Empecemos a practicar tu espanol.)"
+)
+AGE_DECLINED = (
+    "Sorry, you must be 18 or older to use this tutor. "
+    "(Lo siento, debes tener 18 anos o mas para usar este tutor.)"
+)
+
+_AGE_YES = {
+    "yes", "yeah", "yep", "yup", "y", "sure", "ok", "okay",
+    "si", "sí", "claro", "sip", "18", "i'm 18", "im 18",
+}
+_AGE_NO = {"no", "nope", "nah", "n", "under 18", "menor"}
+
+
+def _normalize(text):
+    return (text or "").strip().lower()
+
+
+def _is_affirmative_age(text):
+    t = _normalize(text)
+    return t in _AGE_YES or "18 or older" in t or "older than 18" in t
+
+
+def _is_negative_age(text):
+    t = _normalize(text)
+    return t in _AGE_NO or "under 18" in t or "younger" in t
+
+
 def process_whatsapp_message(body):
     wa_id = body["entry"][0]["changes"][0]["value"]["contacts"][0]["wa_id"]
     name = body["entry"][0]["changes"][0]["value"]["contacts"][0]["profile"]["name"]
@@ -124,7 +159,7 @@ def process_whatsapp_message(body):
             return
 
         repo.upsert_agent(phone_number_id)
-        repo.upsert_user(wa_id, name)
+        user = repo.upsert_user(wa_id, name)
         conversation = repo.get_or_create_conversation(wa_id, phone_number_id)
 
         repo.record_message(
@@ -140,12 +175,38 @@ def process_whatsapp_message(body):
         conversation_id = conversation.id
         previous_response_id = conversation.last_response_id
 
+        # Age gate (self-attested 18+). Unconfirmed users never reach OpenAI.
+        age_status = None
+        if not user.age_confirmed:
+            if _is_affirmative_age(message_body):
+                repo.confirm_age(user)
+                age_status = "just_confirmed"
+            elif _is_negative_age(message_body):
+                age_status = "declined"
+            else:
+                age_status = "prompt"
+
         # Budget gates (checked before spending any OpenAI tokens).
         block_reason = None
         if repo.total_spend_usd() >= spend_cap:
             block_reason = "spend_cap"
         elif repo.count_user_messages_today(wa_id) >= per_user_limit:
             block_reason = "user_limit"
+
+    # Handle the age gate first: confirm, decline, or (re)prompt. In every case
+    # we stop here without calling OpenAI.
+    if age_status == "just_confirmed":
+        logging.info(f"User {wa_id} confirmed age 18+.")
+        _send_text(wa_id, AGE_WELCOME)
+        return
+    if age_status == "declined":
+        logging.info(f"User {wa_id} declined age confirmation.")
+        _send_text(wa_id, AGE_DECLINED)
+        return
+    if age_status == "prompt":
+        logging.info(f"Prompting {wa_id} for age confirmation.")
+        _send_text(wa_id, AGE_PROMPT)
+        return
 
     # If blocked, tell the user politely and stop (no OpenAI call).
     if block_reason == "spend_cap":
