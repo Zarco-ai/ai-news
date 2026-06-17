@@ -1,6 +1,15 @@
+# Secrets / local env
 .env
 docker/.env
+
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 .python-version.local
+
+# Local database artifacts (e.g. the old shelve file)
+*.db
+
+# macOS
+.DS_Store
